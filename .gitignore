@@ -4,6 +4,8 @@
 .vercel
 node_modules
 dist
+playwright-report
+test-results
 .DS_Store
 npm-debug.log*
 .agents

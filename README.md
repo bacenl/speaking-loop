@@ -52,6 +52,23 @@ Use `npm run dev:vercel` for full voice/API testing.
 npm run build
 ```
 
+## CI / PR Workflow
+
+GitHub Actions runs on pull requests and pushes to `master`.
+
+```bash
+npm run build
+npm run test:e2e
+```
+
+The e2e suite uses Playwright with mocked Shisa API responses, mocked tutor
+audio playback, and a mocked VAD. It does not require a real microphone or
+`SHISA_API_KEY` in CI.
+
+Use pull requests for changes. Agents should push branches and update PRs; a
+human should review and merge. Vercel should create preview deployments for PR
+branches and deploy production from `master`.
+
 ## Deploy
 
 The project is configured for Vercel.

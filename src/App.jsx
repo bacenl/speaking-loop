@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { useMicVAD } from "@ricky0123/vad-react";
+import { useAppVAD } from "./vad";
 import {
   Check,
   Circle,
@@ -750,7 +750,7 @@ export default function App() {
     statusRef.current = status;
   }, [status]);
 
-  const vad = useMicVAD({
+  const vad = useAppVAD({
     startOnLoad: false,
     model: "v5",
     baseAssetPath: VAD_ASSET_PATH,
