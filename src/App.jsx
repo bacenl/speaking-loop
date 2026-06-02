@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { useMicVAD } from "@ricky0123/vad-react";
 import {
   Check,
   Circle,
@@ -41,8 +42,11 @@ const STATUS_STYLES = {
 const WAVEFORM_BARS = 40;
 const EMPTY_LEVELS = Array.from({ length: WAVEFORM_BARS }, () => 0);
 const SILENCE_STOP_MS = 4000;
-const RELATIVE_SILENCE_DELTA = 0.014;
-const MAX_RECORDING_MS = 12_000;
+const VAD_SAMPLE_RATE = 16000;
+const VAD_ASSET_PATH =
+  "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/";
+const ONNX_WASM_PATH =
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/";
 
 function makeTracking(targets) {
   return [...targets.words, ...targets.grammar].reduce((acc, target) => {
@@ -64,6 +68,53 @@ async function blobToBase64(blob) {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
   return btoa(binary);
+}
+
+function float32ToWavBlob(samples, sampleRate = VAD_SAMPLE_RATE) {
+  const bytesPerSample = 2;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, value) => {
+    for (let i = 0; i < value.length; i += 1) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 8 * bytesPerSample, true);
+  writeString(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (const sample of samples) {
+    const clamped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(
+      offset,
+      clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff,
+      true,
+    );
+    offset += bytesPerSample;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function frameLevel(frame) {
+  if (!frame?.length) return 0;
+  let sum = 0;
+  for (const sample of frame) sum += sample * sample;
+  return Math.min(1, Math.sqrt(sum / frame.length) * 6);
 }
 
 async function conversationRequest(payload) {
@@ -120,16 +171,6 @@ function collapseSelfDialogue(text) {
     return question || quotedTurns[0];
   }
   return cleaned;
-}
-
-function pickMimeType() {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/ogg;codecs=opus",
-    "audio/mp4",
-    "audio/webm",
-  ];
-  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || "";
 }
 
 function mergeTracking(previous, update = {}) {
@@ -479,7 +520,7 @@ function Waveform({ active, status, levels }) {
       className={`flex h-10 w-48 items-center gap-0.5 rounded-md border px-2 py-1 ${
         active
           ? "border-teal-300 bg-teal-50"
-          : status === "listening"
+          : status === "recording"
             ? "border-slate-300 bg-white"
             : "border-slate-200 bg-slate-50 opacity-60"
       }`}
@@ -502,15 +543,13 @@ function Waveform({ active, status, levels }) {
 
 function Conversation({
   session,
-  setSession,
   status,
-  setStatus,
-  speaking,
-  setSpeaking,
-  media,
+  userSpeaking,
   levels,
+  vadError,
   onEnd,
   onStopRecording,
+  onInterrupt,
 }) {
   const transcriptRef = useRef(null);
 
@@ -520,93 +559,6 @@ function Conversation({
       behavior: "smooth",
     });
   }, [session.history]);
-
-  const submitAudio = async (audioBlob) => {
-    if (audioBlob.size < 1200) {
-      startRecorder();
-      return;
-    }
-    setStatus("thinking");
-    try {
-      const audio = await blobToBase64(audioBlob);
-      const data = await conversationRequest({
-          action: "turn",
-          audio,
-          mimeType: audioBlob.type,
-          history: capHistory(session.history),
-          targets: session.targets,
-          tracking: session.tracking,
-          turnCount: session.turnCount,
-          scenario: session.scenario,
-          voice: session.voice,
-      });
-      const nextHistory = capHistory([
-        ...session.history,
-        {
-          role: "user",
-          content: cleanConversationText(data.userTranscript),
-          translation: data.userTranslation,
-        },
-        {
-          role: "assistant",
-          content: cleanConversationText(data.aiResponse),
-          translation: data.aiTranslation,
-        },
-      ]);
-      const tracking = mergeTracking(session.tracking, data.trackingUpdate);
-      const nextSession = {
-        ...session,
-        history: nextHistory,
-        tracking,
-        turnCount: session.turnCount + 1,
-        terminated: data.terminated,
-      };
-      setSession(nextSession);
-      if (data.audioBase64) {
-        stopTutorAudio();
-        setStatus("speaking");
-        setSpeaking(true);
-        const audioUrl = `data:${data.audioMimeType || "audio/mp3"};base64,${data.audioBase64}`;
-        const player = new Audio(audioUrl);
-        audioPlayerRef.current = player;
-        player.onended = () => {
-          audioPlayerRef.current = null;
-          setSpeaking(false);
-          setStatus(data.terminated ? "idle" : "recording");
-        };
-        player.onerror = () => {
-          audioPlayerRef.current = null;
-          setSpeaking(false);
-          setStatus(data.terminated ? "idle" : "recording");
-        };
-        await player.play();
-      } else {
-        setStatus(data.terminated ? "idle" : "recording");
-      }
-      if (data.terminated) onEnd(nextSession);
-    } catch (error) {
-      console.error(error);
-      setStatus("recording");
-      startRecorder();
-      setSession((current) => ({
-        ...current,
-        error:
-          error.message ||
-          "Something went wrong while processing the conversation turn.",
-      }));
-    }
-  };
-
-  useEffect(() => {
-    media.current.onUtterance = submitAudio;
-  }, [session, media]);
-
-  const interrupt = () => {
-    stopTutorAudio();
-    setSpeaking(false);
-    setStatus("recording");
-    startRecorder();
-  };
 
   return (
     <main className="flex min-h-screen flex-col bg-stone-100 lg:flex-row">
@@ -667,15 +619,15 @@ function Conversation({
               {status}
             </span>
             <Waveform
-              active={media.current.isSpeaking}
+              active={userSpeaking}
               status={status}
               levels={levels}
             />
           </div>
-          {speaking ? (
+          {status === "speaking" ? (
             <button
               type="button"
-              onClick={interrupt}
+              onClick={onInterrupt}
               className="inline-flex items-center gap-2 rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-800"
             >
               <Square size={15} />
@@ -693,7 +645,8 @@ function Conversation({
           ) : (
             <span className="inline-flex items-center gap-2 text-sm text-slate-500">
               <Mic size={15} />
-              Auto-stops after {Math.round(SILENCE_STOP_MS / 1000)}s silence
+              {vadError ||
+                `Auto-stops after ${Math.round(SILENCE_STOP_MS / 1000)}s silence`}
             </span>
           )}
         </footer>
@@ -774,43 +727,14 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [status, setStatus] = useState("idle");
-  const [speaking, setSpeaking] = useState(false);
   const [review, setReview] = useState(null);
   const [reviewMode, setReviewMode] = useState(false);
   const [levels, setLevels] = useState(EMPTY_LEVELS);
+  const [vadError, setVadError] = useState("");
   const audioPlayerRef = useRef(null);
-  const media = useRef({
-    stream: null,
-    recorder: null,
-    chunks: [],
-    analyser: null,
-    raf: null,
-    speakingStartedAt: 0,
-    silenceStartedAt: 0,
-    recordingStartedAt: 0,
-    lastLevelUpdateAt: 0,
-    noiseFloor: 0.025,
-    isSpeaking: false,
-    onUtterance: null,
-  });
   const statusRef = useRef(status);
-  const speakingRef = useRef(speaking);
-
-  const mediaReady = useMemo(() => {
-    return typeof navigator !== "undefined" && Boolean(navigator.mediaDevices);
-  }, []);
-
-  const stopVad = () => {
-    if (media.current.raf) cancelAnimationFrame(media.current.raf);
-    media.current.raf = null;
-    media.current.stream?.getTracks().forEach((track) => track.stop());
-    media.current.stream = null;
-    media.current.isSpeaking = false;
-    stopRecorder(false);
-    media.current.lastLevelUpdateAt = 0;
-    media.current.noiseFloor = 0.025;
-    setLevels(EMPTY_LEVELS);
-  };
+  const submitAudioRef = useRef(null);
+  const manualStopPendingRef = useRef(false);
 
   const stopTutorAudio = () => {
     const player = audioPlayerRef.current;
@@ -826,132 +750,48 @@ export default function App() {
     statusRef.current = status;
   }, [status]);
 
+  const vad = useMicVAD({
+    startOnLoad: false,
+    model: "v5",
+    baseAssetPath: VAD_ASSET_PATH,
+    onnxWASMBasePath: ONNX_WASM_PATH,
+    redemptionMs: SILENCE_STOP_MS,
+    minSpeechMs: 400,
+    preSpeechPadMs: 800,
+    submitUserSpeechOnPause: true,
+    onSpeechStart: () => {
+      if (statusRef.current !== "recording") return;
+      setLevels(EMPTY_LEVELS);
+    },
+    onSpeechEnd: (audio) => {
+      if (statusRef.current !== "recording") return;
+      manualStopPendingRef.current = false;
+      setLevels(EMPTY_LEVELS);
+      submitAudioRef.current?.(float32ToWavBlob(audio));
+    },
+    onVADMisfire: () => {
+      if (statusRef.current !== "recording") return;
+      manualStopPendingRef.current = false;
+      setLevels(EMPTY_LEVELS);
+    },
+    onFrameProcessed: (probabilities, frame) => {
+      if (statusRef.current !== "recording") return;
+      const level = Math.max(frameLevel(frame), probabilities.isSpeech);
+      setLevels((current) => [...current.slice(1), level]);
+    },
+  });
+
   useEffect(() => {
-    speakingRef.current = speaking;
-  }, [speaking]);
+    setVadError(vad.errored || "");
+  }, [vad.errored]);
 
-  const startRecorder = () => {
-    if (media.current.recorder?.state === "recording") return;
-    if (!media.current.stream) return;
-    const mimeType = pickMimeType();
-    const recorder = new MediaRecorder(
-      media.current.stream,
-      mimeType ? { mimeType } : undefined,
-    );
-    media.current.chunks = [];
-    media.current.recordingStartedAt = performance.now();
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) media.current.chunks.push(event.data);
-    };
-    recorder.onstop = () => {
-      if (recorder.shouldSubmit === false) return;
-      const elapsed = performance.now() - media.current.recordingStartedAt;
-      if (elapsed < 500) {
-        startRecorder();
-        return;
-      }
-      const blob = new Blob(media.current.chunks, {
-        type: recorder.mimeType || "audio/webm",
-      });
-      if (blob.size < 1200) {
-        startRecorder();
-        return;
-      }
-      media.current.onUtterance?.(blob);
-    };
-    recorder.start();
-    media.current.recorder = recorder;
-    media.current.isSpeaking = true;
-    media.current.silenceStartedAt = 0;
-    setLevels(EMPTY_LEVELS);
-    setStatus("recording");
-  };
-
-  const stopRecorder = (submit = true) => {
-    const recorder = media.current.recorder;
-    if (recorder?.state === "recording") {
-      recorder.shouldSubmit = submit;
-      recorder.stop();
+  useEffect(() => {
+    if (status === "recording") {
+      void vad.start();
+    } else {
+      void vad.pause();
     }
-    media.current.recorder = null;
-    media.current.isSpeaking = false;
-  };
-
-  const startVad = async () => {
-    if (!mediaReady || typeof MediaRecorder === "undefined") {
-      throw new Error("This browser does not support recording.");
-    }
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const audioContext = new AudioContext();
-    const source = audioContext.createMediaStreamSource(stream);
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 1024;
-    source.connect(analyser);
-    media.current.stream = stream;
-    media.current.analyser = analyser;
-
-    const data = new Uint8Array(analyser.fftSize);
-    const tick = () => {
-      analyser.getByteTimeDomainData(data);
-      let sum = 0;
-      for (const sample of data) {
-        const centered = sample - 128;
-        sum += centered * centered;
-      }
-      const volume = Math.sqrt(sum / data.length) / 128;
-      const now = performance.now();
-      const muted =
-        speakingRef.current ||
-        statusRef.current === "thinking" ||
-        statusRef.current === "speaking";
-      const silenceThreshold = Math.max(
-        media.current.noiseFloor + RELATIVE_SILENCE_DELTA,
-        media.current.noiseFloor * 1.65,
-      );
-      if (!muted && volume < silenceThreshold) {
-        media.current.noiseFloor =
-          media.current.noiseFloor * 0.98 + Math.min(volume, 0.08) * 0.02;
-      }
-      const isBelowStop =
-        volume < silenceThreshold || volume < media.current.noiseFloor + 0.01;
-      if (now - media.current.lastLevelUpdateAt > 45) {
-        media.current.lastLevelUpdateAt = now;
-        const visibleLevel = muted
-          ? 0
-          : Math.min(1, Math.max(0, (volume - media.current.noiseFloor) / 0.08));
-        setLevels((current) => [...current.slice(1), visibleLevel]);
-      }
-
-      if (muted) {
-        media.current.silenceStartedAt = 0;
-        stopRecorder(false);
-      } else if (!media.current.recorder) {
-        startRecorder();
-      } else {
-        const recordingTooLong =
-          now - media.current.recordingStartedAt > MAX_RECORDING_MS;
-        if (recordingTooLong) {
-          media.current.silenceStartedAt = 0;
-          setLevels(EMPTY_LEVELS);
-          stopRecorder();
-        } else if (isBelowStop && !media.current.silenceStartedAt) {
-          media.current.silenceStartedAt = now;
-        } else if (!isBelowStop) {
-          media.current.silenceStartedAt = 0;
-        }
-        if (
-          media.current.silenceStartedAt &&
-          now - media.current.silenceStartedAt > SILENCE_STOP_MS
-        ) {
-          media.current.silenceStartedAt = 0;
-          setLevels(EMPTY_LEVELS);
-          stopRecorder();
-        }
-      }
-      media.current.raf = requestAnimationFrame(tick);
-    };
-    tick();
-  };
+  }, [status, vad.start, vad.pause]);
 
   const fetchFirstTurn = async (baseSession) => {
     return conversationRequest({
@@ -968,25 +808,102 @@ export default function App() {
     if (data.audioBase64) {
       stopTutorAudio();
       setStatus("speaking");
-      setSpeaking(true);
       const player = new Audio(
         `data:${data.audioMimeType || "audio/mp3"};base64,${data.audioBase64}`,
       );
       audioPlayerRef.current = player;
       player.onended = () => {
         audioPlayerRef.current = null;
-        setSpeaking(false);
         setStatus(fallbackStatus);
       };
       player.onerror = () => {
         audioPlayerRef.current = null;
-        setSpeaking(false);
         setStatus(fallbackStatus);
       };
       await player.play();
     } else {
       setStatus(fallbackStatus);
     }
+  };
+
+  const submitAudio = async (audioBlob) => {
+    if (!session) return;
+    if (audioBlob.size < 1200) {
+      setStatus("recording");
+      return;
+    }
+    setStatus("thinking");
+    try {
+      const audio = await blobToBase64(audioBlob);
+      const data = await conversationRequest({
+        action: "turn",
+        audio,
+        mimeType: audioBlob.type,
+        history: capHistory(session.history),
+        targets: session.targets,
+        tracking: session.tracking,
+        turnCount: session.turnCount,
+        scenario: session.scenario,
+        voice: session.voice,
+      });
+      const nextHistory = capHistory([
+        ...session.history,
+        {
+          role: "user",
+          content: cleanConversationText(data.userTranscript),
+          translation: data.userTranslation,
+        },
+        {
+          role: "assistant",
+          content: cleanConversationText(data.aiResponse),
+          translation: data.aiTranslation,
+        },
+      ]);
+      const tracking = mergeTracking(session.tracking, data.trackingUpdate);
+      const nextSession = {
+        ...session,
+        history: nextHistory,
+        tracking,
+        turnCount: session.turnCount + 1,
+        terminated: data.terminated,
+      };
+      setSession(nextSession);
+      if (data.terminated) {
+        await playTutorAudio(data, "idle");
+        endSession(nextSession);
+        return;
+      }
+      await playTutorAudio(data, "recording");
+    } catch (error) {
+      console.error(error);
+      setStatus("recording");
+      setSession((current) => ({
+        ...current,
+        error:
+          error.message ||
+          "Something went wrong while processing the conversation turn.",
+      }));
+    }
+  };
+
+  useEffect(() => {
+    submitAudioRef.current = submitAudio;
+  });
+
+  const handleInterrupt = () => {
+    stopTutorAudio();
+    setStatus("recording");
+  };
+
+  const handleStopRecording = () => {
+    manualStopPendingRef.current = true;
+    void vad.pause().then(() => {
+      if (!manualStopPendingRef.current || statusRef.current !== "recording") {
+        return;
+      }
+      manualStopPendingRef.current = false;
+      void vad.start();
+    });
   };
 
   const requestFirstTurn = async (baseSession) => {
@@ -1021,7 +938,14 @@ export default function App() {
     };
     try {
       setStatus("thinking");
-      await startVad();
+      if (vad.loading) {
+        throw new Error("Voice detector is still loading. Please try again in a moment.");
+      }
+      if (vad.errored) {
+        throw new Error(`Voice detector failed to load: ${vad.errored}`);
+      }
+      await vad.start();
+      await vad.pause();
       const data = await fetchFirstTurn(baseSession);
       const hydratedSession = {
         ...baseSession,
@@ -1042,7 +966,7 @@ export default function App() {
       setShowOnboarding(false);
       await playTutorAudio(data, data.terminated ? "idle" : "recording");
     } catch (caught) {
-      stopVad();
+      await vad.pause();
       setStatus("idle");
       throw caught;
     }
@@ -1050,9 +974,9 @@ export default function App() {
 
   const endSession = async (sessionOverride) => {
     const reviewSession = sessionOverride || session;
-    stopVad();
+    stopTutorAudio();
+    await vad.pause();
     setStatus("idle");
-    setSpeaking(false);
     setReviewMode(true);
     try {
       const data = await conversationRequest({
@@ -1067,7 +991,9 @@ export default function App() {
     }
   };
 
-  useEffect(() => () => stopVad(), []);
+  useEffect(() => () => {
+    void vad.pause();
+  }, [vad.pause]);
 
   if (reviewMode && session) {
     return (
@@ -1092,15 +1018,13 @@ export default function App() {
       {session && (
         <Conversation
           session={session}
-          setSession={setSession}
           status={status}
-          setStatus={setStatus}
-          speaking={speaking}
-          setSpeaking={setSpeaking}
-          media={media}
+          userSpeaking={vad.userSpeaking}
           levels={levels}
-          onStopRecording={() => stopRecorder(true)}
+          vadError={vadError}
+          onStopRecording={handleStopRecording}
           onEnd={endSession}
+          onInterrupt={handleInterrupt}
         />
       )}
       {showOnboarding && (
