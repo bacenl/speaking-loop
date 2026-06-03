@@ -57,65 +57,71 @@ export async function ensureDebugSchema() {
   const db = sql();
   if (!db) return false;
   if (!schemaReady) {
-    schemaReady = db.begin(async (tx) => {
-      await tx`
-        create table if not exists debug_sessions (
-          id uuid primary key,
-          session_number bigserial unique,
-          started_at timestamptz not null default now(),
-          scenario text,
-          targets jsonb not null default '{}'::jsonb,
-          app_version text,
-          client_props jsonb not null default '{}'::jsonb,
-          vad_enabled boolean
-        )
-      `;
-      await tx`
-        create table if not exists debug_messages (
-          id uuid primary key,
-          message_number bigserial unique,
-          session_id uuid references debug_sessions(id) on delete cascade,
-          turn_index integer,
-          role text not null,
-          content text,
-          translation text,
-          created_at timestamptz not null default now()
-        )
-      `;
-      await tx`
-        create table if not exists debug_api_calls (
-          id uuid primary key,
-          session_id uuid references debug_sessions(id) on delete cascade,
-          message_id uuid references debug_messages(id) on delete set null,
-          call_type text not null,
-          provider text,
-          model text,
-          status text not null,
-          latency_ms integer,
-          request_summary jsonb not null default '{}'::jsonb,
-          response_summary jsonb not null default '{}'::jsonb,
-          error text,
-          created_at timestamptz not null default now()
-        )
-      `;
-      await tx`
-        create table if not exists debug_audio (
-          id uuid primary key,
-          session_id uuid references debug_sessions(id) on delete cascade,
-          message_id uuid references debug_messages(id) on delete set null,
-          kind text not null,
-          storage_key text not null,
-          blob_url text,
-          mime_type text,
-          size_bytes integer,
-          created_at timestamptz not null default now()
-        )
-      `;
-      await tx`create index if not exists debug_messages_session_idx on debug_messages(session_id)`;
-      await tx`create index if not exists debug_api_calls_session_idx on debug_api_calls(session_id)`;
-      await tx`create index if not exists debug_audio_session_idx on debug_audio(session_id)`;
-      await tx`create index if not exists debug_sessions_started_at_idx on debug_sessions(started_at desc)`;
-    });
+    schemaReady = db
+      .begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtext('speaking_loop_debug_schema'))`;
+        await tx`
+          create table if not exists debug_sessions (
+            id uuid primary key,
+            session_number bigserial unique,
+            started_at timestamptz not null default now(),
+            scenario text,
+            targets jsonb not null default '{}'::jsonb,
+            app_version text,
+            client_props jsonb not null default '{}'::jsonb,
+            vad_enabled boolean
+          )
+        `;
+        await tx`
+          create table if not exists debug_messages (
+            id uuid primary key,
+            message_number bigserial unique,
+            session_id uuid references debug_sessions(id) on delete cascade,
+            turn_index integer,
+            role text not null,
+            content text,
+            translation text,
+            created_at timestamptz not null default now()
+          )
+        `;
+        await tx`
+          create table if not exists debug_api_calls (
+            id uuid primary key,
+            session_id uuid references debug_sessions(id) on delete cascade,
+            message_id uuid references debug_messages(id) on delete set null,
+            call_type text not null,
+            provider text,
+            model text,
+            status text not null,
+            latency_ms integer,
+            request_summary jsonb not null default '{}'::jsonb,
+            response_summary jsonb not null default '{}'::jsonb,
+            error text,
+            created_at timestamptz not null default now()
+          )
+        `;
+        await tx`
+          create table if not exists debug_audio (
+            id uuid primary key,
+            session_id uuid references debug_sessions(id) on delete cascade,
+            message_id uuid references debug_messages(id) on delete set null,
+            kind text not null,
+            storage_key text not null,
+            blob_url text,
+            mime_type text,
+            size_bytes integer,
+            created_at timestamptz not null default now()
+          )
+        `;
+        await tx`create index if not exists debug_messages_session_idx on debug_messages(session_id)`;
+        await tx`create index if not exists debug_api_calls_session_idx on debug_api_calls(session_id)`;
+        await tx`create index if not exists debug_audio_session_idx on debug_audio(session_id)`;
+        await tx`create index if not exists debug_sessions_started_at_idx on debug_sessions(started_at desc)`;
+      })
+      .catch((error) => {
+        schemaReady = undefined;
+        throw error;
+      });
   }
   await schemaReady;
   return true;
