@@ -8,6 +8,10 @@
     {
       "source": "/api/conversation",
       "destination": "/api/conversation.js"
+    },
+    {
+      "source": "/debug",
+      "destination": "/"
     }
   ]
 }

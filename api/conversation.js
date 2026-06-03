@@ -1,3 +1,12 @@
+import {
+  appVersion,
+  createDebugContext,
+  logDebugApiCall,
+  logDebugMessage,
+  storeDebugAudio,
+  upsertDebugSession,
+} from "./debug/storage.js";
+
 const SHISA_API = "https://api.shisa.ai";
 const SHISA_OPENAI = "https://api.shisa.ai/openai/v1";
 const LLM_MODEL = "shisa-ai/shisa-v2.1-llama3.3-70b";
@@ -43,6 +52,55 @@ async function shisaFetch(url, options) {
     throw new Error(`Shisa API ${response.status}: ${detail}`);
   }
   return response;
+}
+
+async function timedDebugCall(debug, callType, requestSummary, fn) {
+  const startedAt = Date.now();
+  try {
+    const value = await fn();
+    return {
+      value,
+      latencyMs: Date.now() - startedAt,
+      requestSummary,
+    };
+  } catch (error) {
+    await safeDebug(logDebugApiCall({
+      sessionId: debug?.sessionId,
+      callType,
+      provider: "shisa",
+      model: requestSummary?.model,
+      status: "error",
+      latencyMs: Date.now() - startedAt,
+      requestSummary,
+      error: error.message,
+    }));
+    throw error;
+  }
+}
+
+async function safeDebug(task) {
+  try {
+    return await task;
+  } catch (error) {
+    console.error("debug logging failed", {
+      message: error.message,
+    });
+    return null;
+  }
+}
+
+function textSummary(text) {
+  return {
+    length: String(text || "").length,
+    preview: String(text || "").slice(0, 240),
+  };
+}
+
+function audioSummary(base64, mimeType) {
+  return {
+    mimeType,
+    base64Length: String(base64 || "").length,
+  };
 }
 
 async function transcribe({ audio, targets }) {
@@ -436,26 +494,89 @@ async function synthesize(text, voice) {
   };
 }
 
-async function handleStart(body) {
+async function handleStart(body, debug) {
   const focusTarget = chooseFocusTarget(body.targets, body.tracking);
-  const assistant = await chat({
-    history: [],
-    targets: body.targets,
-    tracking: body.tracking,
-    scenario: body.scenario,
-    turnCount: 0,
-    focusTarget,
-    start: true,
-  });
+  const assistantResult = await timedDebugCall(
+    debug,
+    "llm",
+    { model: LLM_MODEL, action: "start", turnCount: 0, focusTarget },
+    () =>
+      chat({
+        history: [],
+        targets: body.targets,
+        tracking: body.tracking,
+        scenario: body.scenario,
+        turnCount: 0,
+        focusTarget,
+        start: true,
+      }),
+  );
+  const assistant = assistantResult.value;
   const trackingUpdate = analyzeAssistantTargets(
     assistant.text,
     body.targets,
     body.tracking,
   );
-  const [aiTranslation, audio] = await Promise.all([
-    translate(assistant.text, "ja", "en"),
-    synthesize(assistant.text, body.voice),
+  const [translationResult, audioResult] = await Promise.all([
+    timedDebugCall(
+      debug,
+      "translation",
+      { sourceLang: "ja", targetLang: "en", text: textSummary(assistant.text) },
+      () => translate(assistant.text, "ja", "en"),
+    ),
+    timedDebugCall(
+      debug,
+      "tts",
+      { voice: body.voice, text: textSummary(assistant.text) },
+      () => synthesize(assistant.text, body.voice),
+    ),
   ]);
+  const aiTranslation = translationResult.value;
+  const audio = audioResult.value;
+  const assistantMessage = await safeDebug(logDebugMessage({
+    sessionId: debug?.sessionId,
+    turnIndex: 0,
+    role: "assistant",
+    content: assistant.text,
+    translation: aiTranslation,
+  }));
+  await safeDebug(Promise.all([
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      callType: "llm",
+      model: LLM_MODEL,
+      status: "success",
+      latencyMs: assistantResult.latencyMs,
+      requestSummary: assistantResult.requestSummary,
+      responseSummary: textSummary(assistant.text),
+    }),
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      callType: "translation",
+      status: "success",
+      latencyMs: translationResult.latencyMs,
+      requestSummary: translationResult.requestSummary,
+      responseSummary: textSummary(aiTranslation),
+    }),
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      callType: "tts",
+      status: "success",
+      latencyMs: audioResult.latencyMs,
+      requestSummary: audioResult.requestSummary,
+      responseSummary: audioSummary(audio.audioBase64, audio.audioMimeType),
+    }),
+    storeDebugAudio({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      kind: "assistant_tts",
+      base64: audio.audioBase64,
+      mimeType: audio.audioMimeType,
+    }),
+  ]));
   return {
     aiResponse: assistant.text,
     aiTranslation,
@@ -466,8 +587,17 @@ async function handleStart(body) {
   };
 }
 
-async function handleTurn(body) {
-  const userTranscript = await transcribe(body);
+async function handleTurn(body, debug) {
+  const asrResult = await timedDebugCall(
+    debug,
+    "asr",
+    {
+      audio: audioSummary(body.audio, body.mimeType),
+      hotwordCount: (body.targets?.words?.length || 0) + (body.targets?.grammar?.length || 0),
+    },
+    () => transcribe(body),
+  );
+  const userTranscript = asrResult.value;
   const userTrackingUpdate = analyzeUserTargets(
     userTranscript,
     body.targets,
@@ -482,17 +612,64 @@ async function handleTurn(body) {
     ...(body.history || []),
     { role: "user", content: userTranscript },
   ];
-  const [userTranslation, assistant] = await Promise.all([
-    translate(userTranscript, "ja", "en"),
-    chat({
-      history: nextHistory,
-      targets: body.targets,
-      tracking: trackingAfterUser,
-      scenario: body.scenario,
-      turnCount: body.turnCount,
-      focusTarget,
-    }),
+  const [userTranslationResult, assistantResult] = await Promise.all([
+    timedDebugCall(
+      debug,
+      "translation",
+      { sourceLang: "ja", targetLang: "en", text: textSummary(userTranscript) },
+      () => translate(userTranscript, "ja", "en"),
+    ),
+    timedDebugCall(
+      debug,
+      "llm",
+      { model: LLM_MODEL, action: "turn", turnCount: body.turnCount, focusTarget },
+      () =>
+        chat({
+          history: nextHistory,
+          targets: body.targets,
+          tracking: trackingAfterUser,
+          scenario: body.scenario,
+          turnCount: body.turnCount,
+          focusTarget,
+        }),
+    ),
   ]);
+  const userTranslation = userTranslationResult.value;
+  const assistant = assistantResult.value;
+  const userMessage = await safeDebug(logDebugMessage({
+    sessionId: debug?.sessionId,
+    turnIndex: body.turnCount,
+    role: "user",
+    content: userTranscript,
+    translation: userTranslation,
+  }));
+  await safeDebug(Promise.all([
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: userMessage?.id,
+      callType: "asr",
+      status: "success",
+      latencyMs: asrResult.latencyMs,
+      requestSummary: asrResult.requestSummary,
+      responseSummary: textSummary(userTranscript),
+    }),
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: userMessage?.id,
+      callType: "translation",
+      status: "success",
+      latencyMs: userTranslationResult.latencyMs,
+      requestSummary: userTranslationResult.requestSummary,
+      responseSummary: textSummary(userTranslation),
+    }),
+    storeDebugAudio({
+      sessionId: debug?.sessionId,
+      messageId: userMessage?.id,
+      kind: "user_input",
+      base64: body.audio,
+      mimeType: body.mimeType,
+    }),
+  ]));
   const assistantTrackingUpdate = analyzeAssistantTargets(
     assistant.text,
     body.targets,
@@ -502,10 +679,66 @@ async function handleTurn(body) {
     userTrackingUpdate,
     assistantTrackingUpdate,
   );
-  const [aiTranslation, audio] = await Promise.all([
-    translate(assistant.text, "ja", "en"),
-    synthesize(assistant.text, body.voice),
+  const [aiTranslationResult, audioResult] = await Promise.all([
+    timedDebugCall(
+      debug,
+      "translation",
+      { sourceLang: "ja", targetLang: "en", text: textSummary(assistant.text) },
+      () => translate(assistant.text, "ja", "en"),
+    ),
+    timedDebugCall(
+      debug,
+      "tts",
+      { voice: body.voice, text: textSummary(assistant.text) },
+      () => synthesize(assistant.text, body.voice),
+    ),
   ]);
+  const aiTranslation = aiTranslationResult.value;
+  const audio = audioResult.value;
+  const assistantMessage = await safeDebug(logDebugMessage({
+    sessionId: debug?.sessionId,
+    turnIndex: body.turnCount,
+    role: "assistant",
+    content: assistant.text,
+    translation: aiTranslation,
+  }));
+  await safeDebug(Promise.all([
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      callType: "llm",
+      model: LLM_MODEL,
+      status: "success",
+      latencyMs: assistantResult.latencyMs,
+      requestSummary: assistantResult.requestSummary,
+      responseSummary: textSummary(assistant.text),
+    }),
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      callType: "translation",
+      status: "success",
+      latencyMs: aiTranslationResult.latencyMs,
+      requestSummary: aiTranslationResult.requestSummary,
+      responseSummary: textSummary(aiTranslation),
+    }),
+    logDebugApiCall({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      callType: "tts",
+      status: "success",
+      latencyMs: audioResult.latencyMs,
+      requestSummary: audioResult.requestSummary,
+      responseSummary: audioSummary(audio.audioBase64, audio.audioMimeType),
+    }),
+    storeDebugAudio({
+      sessionId: debug?.sessionId,
+      messageId: assistantMessage?.id,
+      kind: "assistant_tts",
+      base64: audio.audioBase64,
+      mimeType: audio.audioMimeType,
+    }),
+  ]));
   return {
     userTranscript,
     userTranslation,
@@ -518,7 +751,7 @@ async function handleTurn(body) {
   };
 }
 
-async function handleReview(body) {
+async function handleReview(body, debug) {
   const targets = [
     ...(body.targets?.words || []),
     ...(body.targets?.grammar || []),
@@ -532,7 +765,11 @@ Return JSON with this shape:
 {"summary":"3-5 sentence English paragraph","targetNotes":{"target":"one-line English note"}}
 Be warm and specific. Do not be generic.`;
 
-  const response = await shisaFetch(`${SHISA_OPENAI}/chat/completions`, {
+  const reviewResult = await timedDebugCall(
+    debug,
+    "review",
+    { model: LLM_MODEL, targetCount: targets.length },
+    () => shisaFetch(`${SHISA_OPENAI}/chat/completions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${bearerKey()}`,
@@ -544,9 +781,20 @@ Be warm and specific. Do not be generic.`;
       temperature: 0.4,
       max_tokens: 700,
     }),
-  });
+  }),
+  );
+  const response = reviewResult.value;
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content || "{}";
+  await safeDebug(logDebugApiCall({
+    sessionId: debug?.sessionId,
+    callType: "review",
+    model: LLM_MODEL,
+    status: "success",
+    latencyMs: reviewResult.latencyMs,
+    requestSummary: reviewResult.requestSummary,
+    responseSummary: textSummary(content),
+  }));
   try {
     return JSON.parse(content.replace(/^```json|```$/g, "").trim());
   } catch {
@@ -570,15 +818,21 @@ export default async function handler(req, res) {
 
   try {
     const body = await readBody(req);
+    const debug = createDebugContext({
+      ...body,
+      appVersion: body.appVersion || appVersion(),
+    });
+    await safeDebug(upsertDebugSession(body, debug));
     console.info("conversation api action", {
       action: body.action,
+      sessionId: debug.sessionId,
       hasAudio: Boolean(body.audio),
       targetCount:
         (body.targets?.words?.length || 0) + (body.targets?.grammar?.length || 0),
     });
-    if (body.action === "start") return json(res, 200, await handleStart(body));
-    if (body.action === "turn") return json(res, 200, await handleTurn(body));
-    if (body.action === "review") return json(res, 200, await handleReview(body));
+    if (body.action === "start") return json(res, 200, await handleStart(body, debug));
+    if (body.action === "turn") return json(res, 200, await handleTurn(body, debug));
+    if (body.action === "review") return json(res, 200, await handleReview(body, debug));
     return json(res, 400, { error: "Unknown action." });
   } catch (error) {
     console.error("conversation api failed", {

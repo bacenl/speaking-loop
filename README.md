@@ -32,6 +32,15 @@ Set your Shisa key:
 SHISA_API_KEY=your_key_here
 ```
 
+Optional debug logging uses Postgres for metadata and Vercel Blob for audio:
+
+```bash
+POSTGRES_URL=postgres://...
+BLOB_READ_WRITE_TOKEN=...
+DEBUG_ADMIN_TOKEN=choose_a_long_secret
+DEBUG_LOGGING_ENABLED=true
+```
+
 Run with Vercel dev so the API route is available:
 
 ```bash
@@ -77,6 +86,10 @@ Add the production environment variable in Vercel:
 
 ```bash
 SHISA_API_KEY=your_key_here
+POSTGRES_URL=postgres://...
+BLOB_READ_WRITE_TOKEN=...
+DEBUG_ADMIN_TOKEN=choose_a_long_secret
+DEBUG_LOGGING_ENABLED=true
 ```
 
 Deploy:
@@ -88,6 +101,8 @@ npx vercel deploy --prod
 ## Architecture
 
 The browser owns session state and sends it to the serverless function on each turn.
+When debug logging is configured, the server stores metadata in Postgres and
+audio files in Vercel Blob.
 
 ```text
 Browser
@@ -96,16 +111,23 @@ Browser
   -> Browser
 ```
 
-No database or user accounts are used.
-
 The API supports:
 
 - `action: "start"`: first tutor message
 - `action: "turn"`: process one user utterance
 - `action: "review"`: generate final review
 
+Protected debug endpoints:
+
+- `GET /debug`: in-app dashboard
+- `GET /api/debug/summary`: aggregate counts
+- `GET /api/debug/messages`: recent chat/API log rows
+- `GET /api/debug/audio?key=...`: authenticated audio proxy
+- `POST /api/debug/cleanup`: delete logs/audio older than 30 days
+
 ## Notes
 
 - The Shisa key must stay server-side. Do not expose it in frontend code.
+- `DEBUG_ADMIN_TOKEN` protects debug logs and audio. Do not expose it publicly.
 - `.env`, `.vercel`, `dist`, and `node_modules` are intentionally ignored.
 - The current implementation returns one JSON response per turn. It does not yet stream LLM/TTS audio sentence-by-sentence.

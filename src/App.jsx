@@ -47,6 +47,10 @@ const VAD_ASSET_PATH =
   "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/";
 const ONNX_WASM_PATH =
   "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/";
+const APP_VERSION =
+  import.meta.env.VITE_APP_VERSION ||
+  import.meta.env.VITE_VERCEL_GIT_COMMIT_SHA ||
+  "0.1.0";
 
 function makeTracking(targets) {
   return [...targets.words, ...targets.grammar].reduce((acc, target) => {
@@ -126,6 +130,34 @@ async function conversationRequest(payload) {
   });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
+}
+
+function detectBrowser(userAgent) {
+  if (/Edg\//.test(userAgent)) return "Edge";
+  if (/Chrome\//.test(userAgent)) return "Chrome";
+  if (/Firefox\//.test(userAgent)) return "Firefox";
+  if (/Safari\//.test(userAgent)) return "Safari";
+  return "Unknown";
+}
+
+function detectOS(userAgent) {
+  if (/Windows/i.test(userAgent)) return "Windows";
+  if (/Mac OS X/i.test(userAgent)) return "macOS";
+  if (/Android/i.test(userAgent)) return "Android";
+  if (/iPhone|iPad/i.test(userAgent)) return "iOS";
+  if (/Linux/i.test(userAgent)) return "Linux";
+  return "Unknown";
+}
+
+function makeClientProps(vadEnabled) {
+  const userAgent = navigator.userAgent || "";
+  return {
+    os: detectOS(userAgent),
+    browser: detectBrowser(userAgent),
+    userAgent,
+    language: navigator.language,
+    vadEnabled,
+  };
 }
 
 function cleanConversationText(text = "") {
@@ -723,7 +755,184 @@ function Review({ session, review, onSameWords, onChangeTargets }) {
   );
 }
 
+function DebugDashboard() {
+  const initialToken = new URLSearchParams(window.location.search).get("token") || "";
+  const [token, setToken] = useState(initialToken);
+  const [summary, setSummary] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const fetchDebug = async () => {
+    if (!token) {
+      setError("Enter DEBUG_ADMIN_TOKEN to view debug logs.");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const headers = { "x-debug-token": token };
+      const [summaryResponse, messagesResponse] = await Promise.all([
+        fetch("/api/debug/summary", { headers }),
+        fetch("/api/debug/messages?limit=100", { headers }),
+      ]);
+      if (!summaryResponse.ok) throw new Error(await summaryResponse.text());
+      if (!messagesResponse.ok) throw new Error(await messagesResponse.text());
+      setSummary(await summaryResponse.json());
+      const data = await messagesResponse.json();
+      setMessages(data.messages || []);
+    } catch (caught) {
+      setError(caught.message || "Could not load debug logs.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (initialToken) void fetchDebug();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const audioUrl = (key) =>
+    `/api/debug/audio?key=${encodeURIComponent(key)}&token=${encodeURIComponent(token)}`;
+
+  return (
+    <main className="min-h-screen bg-stone-100 p-4">
+      <section className="mx-auto max-w-7xl space-y-4">
+        <header className="border-b border-slate-200 bg-stone-50 py-4">
+          <p className="text-sm font-semibold uppercase tracking-wide text-teal-700">
+            Debug
+          </p>
+          <h1 className="mt-1 text-2xl font-semibold text-slate-950">
+            Speaking Loop logs
+          </h1>
+        </header>
+
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="grid gap-1 text-sm text-slate-700">
+            Admin token
+            <input
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+              className="w-80 rounded-md border border-slate-300 bg-white px-3 py-2 outline-none focus:border-teal-600"
+              type="password"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={fetchDebug}
+            disabled={loading}
+            className="rounded-md bg-slate-950 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+          >
+            {loading ? "Loading" : "Refresh"}
+          </button>
+        </div>
+
+        {error && (
+          <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
+            {error}
+          </div>
+        )}
+
+        <div className="grid gap-3 sm:grid-cols-4">
+          {[
+            ["Messages", summary?.messages ?? 0],
+            ["Sessions", summary?.sessions ?? 0],
+            ["API calls", summary?.api_calls ?? 0],
+            ["Audio files", summary?.audio_files ?? 0],
+          ].map(([label, value]) => (
+            <div key={label} className="rounded-lg border border-slate-200 bg-white p-4">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                {label}
+              </p>
+              <p className="mt-2 text-3xl font-semibold text-slate-950">{value}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+          <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+            <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-3 py-2">Time</th>
+                <th className="px-3 py-2">Message ID</th>
+                <th className="px-3 py-2">Session</th>
+                <th className="px-3 py-2">Role</th>
+                <th className="px-3 py-2">Calls</th>
+                <th className="px-3 py-2">App</th>
+                <th className="px-3 py-2">Client</th>
+                <th className="px-3 py-2">Message</th>
+                <th className="px-3 py-2">Audio</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {messages.map((message) => (
+                <tr key={message.message_id} className="align-top">
+                  <td className="whitespace-nowrap px-3 py-2 text-slate-600">
+                    {new Date(message.created_at).toLocaleString()}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs text-slate-500">
+                    {message.message_number}
+                  </td>
+                  <td className="px-3 py-2">{message.session_number}</td>
+                  <td className="px-3 py-2">{message.role}</td>
+                  <td className="px-3 py-2">
+                    {(message.api_calls || []).map((call) => (
+                      <span
+                        key={call.id}
+                        className="mr-1 inline-flex rounded-md border border-slate-200 px-1.5 py-0.5 text-xs"
+                      >
+                        {call.callType}:{call.status}
+                        {call.latencyMs ? ` ${call.latencyMs}ms` : ""}
+                      </span>
+                    ))}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs">
+                    {message.app_version}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-slate-600">
+                    {message.client_props?.os || "Unknown"} /{" "}
+                    {message.client_props?.browser || "Unknown"} / VAD{" "}
+                    {message.vad_enabled ? "on" : "off"}
+                  </td>
+                  <td className="max-w-sm px-3 py-2">
+                    <p className="line-clamp-4 text-slate-950">{message.content}</p>
+                    {message.translation && (
+                      <p className="mt-1 line-clamp-3 text-xs text-slate-500">
+                        {message.translation}
+                      </p>
+                    )}
+                  </td>
+                  <td className="min-w-56 px-3 py-2">
+                    {(message.audio || []).map((audio) => (
+                      <div key={audio.id} className="mb-2">
+                        <p className="text-xs text-slate-500">
+                          {audio.kind} ({Math.round((audio.sizeBytes || 0) / 1024)} KB)
+                        </p>
+                        <audio controls src={audioUrl(audio.key)} className="h-8 w-52" />
+                      </div>
+                    ))}
+                  </td>
+                </tr>
+              ))}
+              {messages.length === 0 && (
+                <tr>
+                  <td className="px-3 py-8 text-center text-slate-500" colSpan={9}>
+                    No debug rows loaded.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  );
+}
+
 export default function App() {
+  if (window.location.pathname === "/debug") return <DebugDashboard />;
+
   const [session, setSession] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [status, setStatus] = useState("idle");
@@ -735,6 +944,7 @@ export default function App() {
   const statusRef = useRef(status);
   const submitAudioRef = useRef(null);
   const manualStopPendingRef = useRef(false);
+  const sessionIdRef = useRef(crypto.randomUUID());
 
   const stopTutorAudio = () => {
     const player = audioPlayerRef.current;
@@ -793,15 +1003,22 @@ export default function App() {
     }
   }, [status, vad.start, vad.pause]);
 
+  const conversationPayload = (payload) => ({
+    ...payload,
+    sessionId: sessionIdRef.current,
+    appVersion: APP_VERSION,
+    clientProps: makeClientProps(!vad.errored),
+  });
+
   const fetchFirstTurn = async (baseSession) => {
-    return conversationRequest({
+    return conversationRequest(conversationPayload({
         action: "start",
         targets: baseSession.targets,
         tracking: baseSession.tracking,
         turnCount: 0,
         scenario: baseSession.scenario,
         voice: baseSession.voice,
-    });
+    }));
   };
 
   const playTutorAudio = async (data, fallbackStatus = "recording") => {
@@ -835,7 +1052,7 @@ export default function App() {
     setStatus("thinking");
     try {
       const audio = await blobToBase64(audioBlob);
-      const data = await conversationRequest({
+      const data = await conversationRequest(conversationPayload({
         action: "turn",
         audio,
         mimeType: audioBlob.type,
@@ -845,7 +1062,7 @@ export default function App() {
         turnCount: session.turnCount,
         scenario: session.scenario,
         voice: session.voice,
-      });
+      }));
       const nextHistory = capHistory([
         ...session.history,
         {
@@ -979,12 +1196,12 @@ export default function App() {
     setStatus("idle");
     setReviewMode(true);
     try {
-      const data = await conversationRequest({
+      const data = await conversationRequest(conversationPayload({
           action: "review",
           history: reviewSession?.history || [],
           targets: reviewSession?.targets,
           tracking: reviewSession?.tracking,
-      });
+      }));
       setReview(data);
     } catch (error) {
       console.error(error);
